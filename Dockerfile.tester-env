@@ -1,0 +1,82 @@
+# syntax=docker/dockerfile:1
+# Open Source POS app image, built from editable source in this checkout.
+#
+# Upstream's Dockerfile only COPYs an already-built context: release CI runs
+# `composer install --no-dev`, `npm ci` and `npm run build` (gulp) BEFORE
+# `docker build`, and .dockerignore drops composer.json/package.json/gulpfile.js
+# so the image cannot build itself. This file owns those stages instead:
+#   vendor - composer install --no-dev (php stage carries ext-intl)
+#   assets - npm ci + the gulp tasks that bundle public/resources and inject
+#            the rev-hashed bundles into three tracked view files
+#   final  - Apache + vendor/ + generated assets
+#
+# gulp's `update-licenses` task (composer licenses + npx license-report) is
+# deliberately not run: it only feeds the config > system > license tab, which
+# falls back to the shipped LICENSE text. That keeps the assets stage free of
+# PHP/composer and avoids build-time npm registry lookups for license metadata.
+ARG PHP_IMAGE=php:8.2.35-apache
+ARG NODE_IMAGE=node:22-slim
+ARG COMPOSER_IMAGE=composer:2
+
+FROM ${PHP_IMAGE} AS phpbase
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libicu-dev libgd-dev libjpeg62-turbo-dev libfreetype6-dev libpng-dev unzip \
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    && docker-php-ext-install mysqli bcmath intl gd \
+    && a2enmod rewrite \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN printf 'date.timezone = "UTC"\n' > /usr/local/etc/php/conf.d/timezone.ini
+
+FROM ${COMPOSER_IMAGE} AS composerbin
+
+FROM phpbase AS vendor
+COPY --from=composerbin /usr/bin/composer /usr/bin/composer
+WORKDIR /app
+COPY composer.json composer.lock ./
+RUN --mount=type=cache,id=open-source-pos-composer,target=/tmp/composer-cache \
+    COMPOSER_CACHE_DIR=/tmp/composer-cache composer install --no-dev --no-scripts \
+        --no-interaction --prefer-dist --no-progress
+# Classmap regeneration needs app/ (App\ and Config\ PSR-4 paths), so it runs
+# after the source COPY; dependency downloads stay in the cached layer above.
+COPY app ./app
+RUN composer dump-autoload --no-dev --optimize --no-interaction
+
+FROM ${NODE_IMAGE} AS assets
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN --mount=type=cache,id=open-source-pos-npm,target=/root/.npm \
+    npm ci --no-audit --no-fund
+COPY gulpfile.js ./
+COPY app/Views app/Views
+COPY public public
+# Same order as gulpfile's `default` series (minus update-licenses): the debug
+# tasks feed the prod bundles, and prod-js must exist before the login injection.
+# --series matters: gulp runs a bare task list in parallel, which races `clean`
+# against the copy tasks and lets each inject task overwrite the previous one's
+# markers (both prod bundles would end up empty).
+RUN npx gulp --series clean copy-bootswatch copy-bootswatch5 copy-bootstrap copy-menubar \
+        debug-config-js prod-config-js debug-js prod-js \
+        debug-css prod-css debug-login-js prod-login-js
+
+FROM phpbase AS final
+WORKDIR /app
+COPY --chown=www-data:www-data . ./
+COPY --chown=www-data:www-data --from=vendor /app/vendor ./vendor
+COPY --chown=www-data:www-data --from=assets /app/public/resources ./public/resources
+COPY --chown=www-data:www-data --from=assets /app/public/images/menubar ./public/images/menubar
+COPY --chown=www-data:www-data --from=assets /app/app/Views/partial/header.php ./app/Views/partial/header.php
+COPY --chown=www-data:www-data --from=assets /app/app/Views/login.php ./app/Views/login.php
+COPY --chown=www-data:www-data --from=assets /app/app/Views/configs/manage.php ./app/Views/configs/manage.php
+
+# writable/ and uploads/ are the only directories the Apache user writes to;
+# public/license needs at least the LICENSE copy for the config license tab.
+RUN mkdir -p writable/cache writable/logs writable/session writable/debugbar writable/backup \
+        public/uploads/item_pics public/license \
+    && cp LICENSE public/license/LICENSE \
+    && chmod -R u+rwX writable public/uploads public/license \
+    && rm -rf /var/www/html \
+    && ln -nsf /app/public /var/www/html
+
+VOLUME ["/app/public/uploads", "/app/writable/logs"]
+EXPOSE 80
+CMD ["apache2-foreground"]

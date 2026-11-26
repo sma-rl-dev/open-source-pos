@@ -1,0 +1,64 @@
+# Fork-owned Open Source POS deployment for the RL tester environment.
+# Upstream docker-compose.yml runs the prebuilt jekkos/opensourcepos image,
+# publishes fixed port 80, pins container_name `mysql`, and needs a host .env
+# bind mount; this overlay builds from this checkout, scopes names by compose
+# project (RUN_ID) and takes every secret from the environment.
+#
+# Only ${PORT} is published; app and MariaDB talk over the compose default
+# bridge network, no subnet is pinned.
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.tester-env
+    # Content-addressed tag supplied by scripts/rl-env; never scope it by RUN_ID.
+    image: ${IMAGE_TAG:-tester-env-open-source-pos:dev}
+    ports:
+      - "${PORT:-18272}:80"
+    environment:
+      CI_ENVIRONMENT: production
+      # App::getValidHost compares HTTP_HOST verbatim, including the port, so
+      # the CLI passes the browser origin host:port first. Empty in production
+      # is a fatal startup error.
+      ALLOWED_HOSTNAMES: ${ALLOWED_HOSTNAMES:-localhost:18272,127.0.0.1:18272,localhost}
+      # Fixed secrets: env:provision would otherwise mint random keys, changing
+      # encrypted columns and login-throttle HMACs between resets.
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0}
+      THROTTLE_KEY: ${THROTTLE_KEY:-9a8b7c6d5e4f30211203f4e5d6c7b8a99a8b7c6d5e4f30211203f4e5d6c7b8a9}
+      MYSQL_HOST_NAME: db
+      MYSQL_USERNAME: admin
+      MYSQL_PASSWORD: pointofsale
+      MYSQL_DB_NAME: ospos
+      # Login throttle (app/Filters/Throttle.php reads env() directly, so the
+      # dotted .env-style names work as plain environment variables). Default 5
+      # POSTs/60s per IP would trip on deploy + verify + an agent retry loop.
+      "throttle.capacity": ${THROTTLE_CAPACITY:-1000}
+      "throttle.seconds": ${THROTTLE_SECONDS:-60}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/public/uploads
+      - logs:/app/writable/logs
+
+  db:
+    # Upstream docker/docker-mysql.yml pins mariadb:10.5; keep the same branch.
+    image: mariadb:10.5
+    environment:
+      MYSQL_ROOT_PASSWORD: pointofsale
+      MYSQL_DATABASE: ospos
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: pointofsale
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-ppointofsale"]
+      start_period: 20s
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    volumes:
+      - db:/var/lib/mysql
+
+volumes:
+  uploads:
+  logs:
+  db:

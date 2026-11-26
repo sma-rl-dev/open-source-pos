@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+# Open Source POS - Tester Environment CLI. See docs/APP_CLI_PATTERN.md in the
+# corpus repo; this file lives at the app checkout root.
+#
+# Topology: app (PHP 8.2.35 CodeIgniter 4 on Apache, built from this checkout by
+# Dockerfile.tester-env: composer stage + node 22 gulp stage + Apache) and db
+# (MariaDB 10.5). The schema is installed by the app itself: POST /login runs
+# `migrateToCI4()` + `latest()` (47 migrations) and the initial_schema.sql seed
+# creates admin/pointofsale, app_config defaults and one stock location. No
+# .env file is needed: the keys are passed as ENCRYPTION_KEY / THROTTLE_KEY and
+# the DB connection as MYSQL_* variables, all read through getenv().
+#
+# Commands: deploy, seed, verify, reset, stop, logs, status, url, help
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-18272}"
+
+# Seeded by sqlscripts/initial_schema.sql; the login form posts these.
+ADMIN_USER="${ADMIN_USER:-admin}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-pointofsale}"
+# Must match the db service credentials in docker-compose.tester-env.yml; used
+# only by `seed`/`verify` to read and write the app database.
+DB_USER="${MYSQL_USERNAME:-admin}"
+DB_PASSWORD="${MYSQL_PASSWORD:-pointofsale}"
+DB_NAME="${MYSQL_DB_NAME:-ospos}"
+# The login throttler allows 5 POSTs per 60s per IP (app/Filters/Throttle.php).
+# deploy + verify + a browser login stay under that, but repeated verification
+# or an agent retry loop does not, so the deployment raises the knobs instead of
+# disabling the filter (capacity <= 0 would disable it).
+THROTTLE_CAPACITY="${THROTTLE_CAPACITY:-1000}"
+THROTTLE_SECONDS="${THROTTLE_SECONDS:-60}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        # Compose project names allow only [a-z0-9_-]; rl-env run ids may contain
+        # dots, so normalise instead of failing the compose call.
+        suffix="-$(printf '%s' "${RUN_ID}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g')"
+    fi
+    COMPOSE_PROJECT="tester-env-open-source-pos${suffix}"
+    export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-open-source-pos:dev}"
+    # ALLOWED_HOSTNAMES entries are compared against HTTP_HOST verbatim
+    # (app/Config/App.php getValidHost), i.e. including the port. Production
+    # refuses to start when the list is empty, so always pass host:port for the
+    # browser origin plus loopback, host.docker.internal (the browser-checker
+    # origin) and the default bridge gateway (what scripts/rl-env publishes).
+    BROWSER_ORIGIN="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+    BROWSER_HOST="${BROWSER_ORIGIN#*://}"
+    BROWSER_HOST="${BROWSER_HOST%%/*}"
+    local gateway="${TESTER_ENV_HOST_GATEWAY:-}"
+    if [[ -z "${gateway}" ]]; then
+        gateway="$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)"
+    fi
+    gateway="${gateway:-172.17.0.1}"
+    ALLOWED_HOSTNAMES="localhost:${PORT},127.0.0.1:${PORT},host.docker.internal:${PORT},${gateway}:${PORT},${BROWSER_HOST},localhost"
+    export PORT IMAGE_TAG ALLOWED_HOSTNAMES \
+        THROTTLE_CAPACITY THROTTLE_SECONDS \
+        ENCRYPTION_KEY="${ENCRYPTION_KEY:-0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0}" \
+        THROTTLE_KEY="${THROTTLE_KEY:-9a8b7c6d5e4f30211203f4e5d6c7b8a99a8b7c6d5e4f30211203f4e5d6c7b8a9}"
+}
+
+compose() {
+    docker compose -p "${COMPOSE_PROJECT}" -f "${SCRIPT_DIR}/docker-compose.tester-env.yml" "$@"
+}
+
+require_running() {
+    if [[ -z "$(compose ps -q app 2>/dev/null)" ]]; then
+        echo "==> Stack is not running. Run './tester-env deploy' first." >&2
+        return 1
+    fi
+}
+
+# The seed and verify SQL runs inside the db container; only its stdin file is
+# host-side, so the app container does not need a mysql client.
+mysql_ospos() {
+    compose exec -T db mysql -u"${DB_USER}" -p"${DB_PASSWORD}" "${DB_NAME}" "$@"
+}
+
+# The app is probed on loopback: TESTER_ENV_BROWSER_ORIGIN (host.docker.internal
+# or the bridge gateway) is not necessarily host-resolvable.
+wait_http() {
+    echo "==> Waiting for GET /login (up to ~240s)..."
+    for _ in $(seq 1 120); do
+        if curl -fsS -o /dev/null "http://127.0.0.1:${PORT}/login" 2>/dev/null; then
+            echo "==> App is ready at http://localhost:${PORT}/login"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "==> Timed out waiting for GET /login" >&2
+    compose logs --tail=60 app db || true
+    return 1
+}
+
+# POST /login with the seeded credentials. A fresh database runs the migrations
+# on the first POST and redirects back to /login before validating anything
+# (app/Controllers/Login.php:66), so retry until the redirect lands on /home.
+# CSRF is not applied to login|migrate (app/Config/Filters.php), hence no token.
+login_jar() {
+    local base="$1" jar="$2" attempt code
+    for attempt in 1 2 3; do
+        code="$(curl -sS -o /dev/null -w '%{http_code}' -b "${jar}" -c "${jar}" \
+            --data-urlencode "username=${ADMIN_USER}" \
+            --data-urlencode "password=${ADMIN_PASSWORD}" \
+            --data-urlencode "login-button=1" \
+            "${base}/login" || true)"
+        if [[ "${code}" == "302" || "${code}" == "303" ]]; then
+            if curl -fsS -b "${jar}" "${base}/home" 2>/dev/null | grep -q 'home/logout'; then
+                return 0
+            fi
+        fi
+        echo "    login attempt ${attempt} -> HTTP ${code}, retrying..." >&2
+        sleep 2
+    done
+    return 1
+}
+
+# The browser origin is normally reachable from the host too (only ${PORT} is
+# published); fall back to loopback when it is not, e.g. a container-only origin.
+verify_base() {
+    if curl -fsS --max-time 3 -o /dev/null "${BROWSER_ORIGIN}/login" 2>/dev/null; then
+        echo "${BROWSER_ORIGIN}"
+    else
+        echo "http://127.0.0.1:${PORT}"
+    fi
+}
+
+cmd_deploy() {
+    refresh_names
+    echo "==> Deploying Open Source POS (image=${IMAGE_NAME}, project=${COMPOSE_PROJECT}, port=${PORT})..."
+    echo "    browser origin: ${BROWSER_ORIGIN}  allowed hosts: ${ALLOWED_HOSTNAMES}"
+    echo "==> Resetting previous containers + volumes (deterministic first start)..."
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+    echo "==> Building from source and starting app + db..."
+    compose up --build -d
+    wait_http
+    echo "==> Running migrations and logging in as '${ADMIN_USER}' (first start applies 47 migrations)..."
+    local jar
+    jar="$(mktemp)"
+    if ! login_jar "http://127.0.0.1:${PORT}" "${jar}"; then
+        rm -f "${jar}"
+        echo "==> Login as ${ADMIN_USER} failed after start" >&2
+        compose logs --tail=60 app db || true
+        return 1
+    fi
+    rm -f "${jar}"
+    echo "==> Deployment complete."
+    echo "    URL:      http://localhost:${PORT}/login"
+    echo "    Browser:  ${BROWSER_ORIGIN}/login"
+    echo "    Login:    ${ADMIN_USER} / ${ADMIN_PASSWORD}"
+}
+
+cmd_seed() {
+    refresh_names
+    require_running
+    local seed_file="${SCRIPT_DIR}/tester-env-seed.sql"
+    local fingerprint_file="${SCRIPT_DIR}/tester-env-fingerprint.sql"
+    [[ -f "${seed_file}" && -f "${fingerprint_file}" ]] || {
+        echo "==> Seed SQL is missing next to tester-env." >&2
+        return 1
+    }
+    # The migrations run on the first login, so deploy must have happened.
+    if ! mysql_ospos -N -B -e 'SELECT COUNT(*) FROM ospos_migrations' >/dev/null 2>&1; then
+        echo "==> App schema is not migrated. Run './tester-env deploy' first." >&2
+        return 1
+    fi
+    echo "==> Seeding deterministic baseline data (idempotent)..."
+    mysql_ospos < "${seed_file}"
+    # app_config is cached by App\Config\OSPOS on first use (deploy logs in
+    # before seeding), so cache the seeded tax defaults only after the write.
+    echo "==> Clearing cached app settings..."
+    compose exec -T app sh -c 'php spark cache:clear >/dev/null 2>&1' || true
+    local fingerprint
+    fingerprint="$(mysql_ospos -N -B < "${fingerprint_file}" | tail -n1 | tr -d '\r')"
+    echo "==> Seed complete."
+    echo "    15 items / 6 categories, 6 customers, 3 suppliers, 4 completed sales, 1 receiving"
+    echo "    Fingerprint: ${fingerprint}"
+}
+
+cmd_verify() {
+    refresh_names
+    require_running
+    command -v jq >/dev/null 2>&1 || { echo "==> jq is required for verify" >&2; return 1; }
+
+    local base jar body
+    base="$(verify_base)"
+    echo "==> Verifying GET ${base}/login ..."
+    body="$(curl -fsS "${base}/login")"
+    grep -q 'name="username"' <<<"${body}" || { echo "==> /login is not the login form" >&2; return 1; }
+    grep -q 'name="password"' <<<"${body}" || { echo "==> /login form has no password field" >&2; return 1; }
+    echo "    OK (login form served)"
+    echo "==> Verifying login as ${ADMIN_USER} ..."
+    jar="$(mktemp)"
+    if ! login_jar "${base}" "${jar}"; then
+        rm -f "${jar}"
+        echo "==> login failed" >&2
+        return 1
+    fi
+    body="$(curl -fsS -b "${jar}" "${base}/home")"
+    grep -q 'Open Source Point of Sale' <<<"${body}" || { rm -f "${jar}"; echo "==> /home has no company header" >&2; return 1; }
+    echo "    OK (authenticated /home rendered with the seeded company)"
+
+    # Authenticated JSON/HTML assertions over the seeded baseline.
+    local tz today sale_min sale_max
+    json() { curl -fsS -b "${jar}" "${base}$1"; }
+    json_fail() { echo "==> $1" >&2; rm -f "${jar}"; return 1; }
+    jq_check() { jq -e "$2" >/dev/null 2>&1 <<<"$1"; }
+
+    echo "==> Verifying seeded catalog, contacts, sales and reports ..."
+
+    body="$(json '/items/search?search=&limit=100&offset=0&sort=items.item_id&order=asc')" \
+        || { json_fail "items/search did not return JSON (is the seed applied?)"; return 1; }
+    jq_check "${body}" '.total == 15' || { json_fail "expected 15 items, got $(jq -r '.total' <<<"${body}" 2>/dev/null)"; return 1; }
+    for name in 'House Blend Coffee 12 oz' 'Sourdough Loaf' 'Blueberry Muffin' 'Organic Kale Bunch' 'Extra Virgin Olive Oil 500 ml' 'Dish Soap 16 oz'; do
+        jq -e --arg n "${name}" '[.rows[].name] | index($n) != null' >/dev/null <<<"${body}" \
+            || { json_fail "item '${name}' is missing from /items/search"; return 1; }
+    done
+    jq_check "${body}" '[.rows[] | select(.name == "Dish Soap 16 oz") | .quantity][0] == "0"' \
+        || { json_fail "Dish Soap 16 oz should be at zero stock"; return 1; }
+    jq_check "${body}" '[.rows[] | select(.name == "Blueberry Muffin") | .quantity][0] == "3"' \
+        || { json_fail "Blueberry Muffin should have quantity 3"; return 1; }
+    jq_check "${body}" '[.rows[] | select(.name == "House Blend Coffee 12 oz") | .tax_percents][0] == "8.00%"' \
+        || { json_fail "House Blend Coffee 12 oz should show 8.00% tax"; return 1; }
+    jq_check "${body}" '[.rows[] | select(.name == "Sourdough Loaf") | .tax_percents][0] == "-"' \
+        || { json_fail "Sourdough Loaf should be untaxed"; return 1; }
+    echo "    OK items: 15 rows, quantities 42/3/0, tax 8.00% vs untaxed"
+
+    body="$(json '/customers/search?search=&limit=100&offset=0&sort=people.person_id&order=asc')" \
+        || { json_fail "customers/search did not return JSON"; return 1; }
+    jq_check "${body}" '.total == 6' || { json_fail "expected 6 customers, got $(jq -r '.total' <<<"${body}" 2>/dev/null)"; return 1; }
+    jq_check "${body}" '[.rows[] | select(.last_name == "Hart") | .total][0] == "$33.50"' \
+        || { json_fail "Amelia Hart should show \$33.50 total spent"; return 1; }
+    echo "    OK customers: 6 rows, Hart total spent \$33.50"
+
+    body="$(json '/suppliers/search?search=&limit=100&offset=0&sort=people.person_id&order=asc')" \
+        || { json_fail "suppliers/search did not return JSON"; return 1; }
+    jq_check "${body}" '.total == 3' || { json_fail "expected 3 suppliers"; return 1; }
+    echo "    OK suppliers: 3 rows"
+
+    body="$(json '/sales/search?search=&limit=100&offset=0&sort=sale_id&order=desc&start_date=2000-01-01&end_date=2099-12-31')" \
+        || { json_fail "sales/search did not return JSON"; return 1; }
+    jq_check "${body}" '.total == 4' || { json_fail "expected 4 completed sales"; return 1; }
+    jq_check "${body}" '[.rows[] | select(.sale_id == "-") | .amount_due][0] == "$123.73"' \
+        || { json_fail "sales total should be \$123.73"; return 1; }
+    jq_check "${body}" '.payment_summary | contains("Cash: $60.75") and contains("Credit Card: $25.03") and contains("Debit Card: $37.95")' \
+        || { json_fail "payment summary should be Cash \$60.75 / Credit \$25.03 / Debit \$37.95"; return 1; }
+    echo "    OK sales: 4 completed (total \$123.73), mixed payment types"
+
+    # The sales manage page defaults to the app-timezone "today", so prove the
+    # seeded day has data there without asserting a wall-clock date.
+    tz="$(mysql_ospos -N -B -e 'SELECT value FROM ospos_app_config WHERE `key` = "timezone"')"
+    today="$(mysql_ospos -N -B -e "SELECT DATE(CONVERT_TZ(UTC_TIMESTAMP(), 'UTC', '${tz}'))" | tr -d '\r')"
+    body="$(json "/sales/search?search=&limit=100&offset=0&sort=sale_id&order=desc&start_date=${today}&end_date=${today}")"
+    jq_check "${body}" '.total == 2' || { json_fail "expected 2 sales for the app-timezone today (${today})"; return 1; }
+    echo "    OK sales manage today (${today}): 2 rows"
+
+    read -r sale_min sale_max < <(mysql_ospos -N -B -e 'SELECT DATE(MIN(sale_time)), DATE(MAX(sale_time)) FROM ospos_sales' | tr '\t' ' ')
+    body="$(json "/reports/summary_sales/${sale_min}/${sale_max}/all/all")"
+    if ! grep -q '\$123\.73' <<<"${body}" || ! grep -q '\$4\.70' <<<"${body}"; then
+        json_fail "summary_sales should total \$123.73 with \$4.70 tax"
+        return 1
+    fi
+    echo "    OK report summary_sales: \$123.73 total / \$4.70 tax"
+
+    body="$(json "/reports/summary_items/${sale_min}/${sale_max}/all/all")"
+    [[ "$(grep -o '"item_name":' <<<"${body}" | wc -l)" -eq 11 ]] \
+        || { json_fail "summary_items should list 11 sold item rows"; return 1; }
+    grep -q '"item_name":"House Blend Coffee 12 oz"' <<<"${body}" \
+        || { json_fail "summary_items is missing House Blend Coffee 12 oz"; return 1; }
+    echo "    OK report summary_items: 11 sold item rows"
+
+    body="$(json '/reports/inventory_low')"
+    for name in 'Blueberry Muffin' 'Organic Kale Bunch' 'Dish Soap 16 oz'; do
+        grep -q "${name}" <<<"${body}" || { json_fail "inventory_low is missing ${name}"; return 1; }
+    done
+    if grep -q 'House Blend Coffee 12 oz' <<<"${body}"; then
+        json_fail "inventory_low should not list well-stocked coffee"
+        return 1
+    fi
+    echo "    OK report inventory_low: 3 low-stock items"
+
+    body="$(json "/reports/detailed_receivings/${sale_min}/${sale_max}/all/all")"
+    if ! grep -q 'Hudson Valley Provisions' <<<"${body}" || ! grep -q '\$67\.40' <<<"${body}"; then
+        json_fail "detailed_receivings should show the \$67.40 Hudson Valley Provisions delivery"
+        return 1
+    fi
+    body="$(json '/receivings/receipt/1')"
+    if ! grep -q 'Hudson Valley Provisions' <<<"${body}" || ! grep -q 'RECV 1' <<<"${body}"; then
+        json_fail "receiving receipt 1 should show RECV 1 from Hudson Valley Provisions"
+        return 1
+    fi
+    echo "    OK receivings: 1 delivery, receipt RECV 1 total \$67.40"
+
+    rm -f "${jar}"
+    echo "==> Verification complete."
+}
+
+cmd_url() {
+    refresh_names
+    echo "http://localhost:${PORT}/login"
+}
+
+cmd_reset() {
+    refresh_names
+    echo "==> Resetting environment (containers + db/uploads/logs volumes, image kept)..."
+    compose down -v --remove-orphans
+    echo "==> Clean slate. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    refresh_names
+    echo "==> Stopping containers (volumes preserved)..."
+    compose stop
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    refresh_names
+    compose logs --tail=200 app db 2>/dev/null || echo "==> Containers not running."
+}
+
+cmd_status() {
+    refresh_names
+    if [[ -n "$(compose ps -q 2>/dev/null)" ]]; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}/login"
+        echo "Browser: ${BROWSER_ORIGIN}/login"
+        echo "Project: ${COMPOSE_PROJECT}"
+        # The allowlist is fixed at deploy time from that run's browser origin,
+        # so show what the running container actually accepts.
+        local allowed
+        allowed="$(docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$(compose ps -q app)" 2>/dev/null \
+            | sed -n 's/^ALLOWED_HOSTNAMES=//p')"
+        [[ -n "${allowed}" ]] && echo "Allowed hosts: ${allowed}"
+        docker ps --filter "label=com.docker.compose.project=${COMPOSE_PROJECT}" \
+            --format '  {{.Names}}  {{.Status}}  {{.Ports}}'
+        curl -fsS -o /dev/null -w '  GET /login -> HTTP %{http_code}\n' \
+            "http://127.0.0.1:${PORT}/login" 2>/dev/null || echo "  GET /login not answering"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Project: ${COMPOSE_PROJECT}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Open Source POS - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the app image from this checkout and start app + MariaDB from
+            clean volumes, then run the migrations via POST /login and log in
+            as ${ADMIN_USER}/${ADMIN_PASSWORD}.
+  seed      Apply the deterministic baseline dataset (idempotent): 15 items over
+            6 categories with stock levels, 6 customers, 3 suppliers, 4 completed
+            sales and 1 receiving. Prints a fingerprint of the seeded rows.
+  verify    Assert GET /login serves the login form, ${ADMIN_USER} reaches the
+            authenticated /home page, and the seeded catalog/sales/reports are
+            visible over HTTP (run 'seed' first; requires jq).
+  reset     docker compose down -v (db + uploads + logs volumes), image kept
+  stop      Stop containers (volumes preserved)
+  logs      Show the last 200 app + db log lines
+  status    Show containers, URL and GET /login status
+  url       Print the local URL
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate compose project + volumes for parallel runs. Default: default
+  --port <port>   Host port for Apache. Default: 18272 (or \$PORT)
+
+Env knobs: PORT, RUN_ID, IMAGE_TAG (set by scripts/rl-env),
+TESTER_ENV_BROWSER_ORIGIN (browser-visible origin; also added to
+ALLOWED_HOSTNAMES), ENCRYPTION_KEY, THROTTLE_KEY,
+THROTTLE_CAPACITY / THROTTLE_SECONDS (login throttle; capacity 0 disables),
+ADMIN_USER / ADMIN_PASSWORD, MYSQL_USERNAME / MYSQL_PASSWORD / MYSQL_DB_NAME
+(seed/verify; must match the db service).
+
+Stack: only \${PORT} is published; MariaDB 3306 stays on the compose network.
+State: db volume (all business data), uploads volume (/app/public/uploads),
+logs volume (/app/writable/logs). Reset == deploy from clean volumes.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id) RUN_ID="${2:?--run-id requires a value}"; shift 2 ;;
+            --port) PORT="${2:?--port requires a value}"; shift 2 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; cmd_help; exit 1 ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        url) cmd_url ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Unknown command: ${cmd}" >&2; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

@@ -1,0 +1,26 @@
+# Build context for Dockerfile.tester-env. BuildKit picks this file up by name
+# next to the Dockerfile; upstream .dockerignore stays untouched because it
+# excludes composer.json/package.json/gulpfile.js, which our stages need.
+.git
+.gitignore
+.github
+branding
+design
+docs
+node_modules
+vendor
+public/resources
+public/license/*
+public/images/menubar/*
+dist
+tmp
+tests
+*.patch
+patches
+*.md
+!LICENSE
+.env
+.env.*
+*.log
+.idea
+.vscode
